@@ -1,0 +1,336 @@
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+import serial
+import time
+import threading
+import cv2
+import Main
+import ConexionBD
+
+puerto = "COM4"
+baudios = 9600
+arduino = None
+sistemaActivo = False
+piezasDetectadas = []
+cuadroPpm = None
+totalPiezas = 0
+totalTuercas = 0
+totalRondanas = 0
+totalDescartes = 0
+tiempoInicio = 0
+numeroCuadro = 0
+anchoCuadro = 0
+altoCuadro = 0
+
+# ---------------- Centrado de la pieza bajo la cámara ----------------
+# (valores medidos en la banda real: la banda corre vertical en la imagen y
+#  al avanzar la pieza sube, es decir, la coordenada Y disminuye)
+EJE_BANDA = "y"
+SENTIDO_AVANCE = -1
+# Posición objetivo en píxeles sobre el eje (None = centro del cuadro)
+OBJETIVO_PX = None
+TOLERANCIA_PX = 10          # error aceptable para clasificar
+MAX_AJUSTES = 5             # pulsos de corrección máximos por pieza
+ESPERA_ASENTAR = 0.35       # s para que la banda/pieza se detengan tras moverse
+CUADROS_FRESCOS = 8         # cuadros nuevos a esperar para no usar imágenes viejas
+msPorPixel = Main.MS_POR_PIXEL
+
+def buscarPuertoArduino():
+    """Busca el Arduino por su ID USB (original, CH340, FTDI, CP210x).
+    Si no lo encuentra usa el puerto configurado."""
+    from serial.tools import list_ports
+    fabricantes = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}
+    for p in list_ports.comports():
+        if p.vid in fabricantes:
+            return p.device
+    return puerto
+
+def conectar():
+    global arduino
+    try:
+        arduino = serial.Serial(buscarPuertoArduino(), baudios)
+        time.sleep(2)
+        hilo = threading.Thread(target=leerArduino)
+        hilo.daemon = True
+        hilo.start()
+    except serial.SerialException:
+        messagebox.showerror("Error", "No se pudo conectar al Arduino. Verifique el puerto.")
+
+def leerArduino():
+    while arduino and arduino.is_open:
+        try:
+            linea = arduino.readline().decode().strip()
+            if linea == "P" and sistemaActivo:
+                inspeccionarPieza()
+        except Exception:
+            break
+
+def esperarCuadrosNuevos(cantidad):
+    inicio = numeroCuadro
+    limite = time.time() + 2
+    while numeroCuadro - inicio < cantidad and time.time() < limite:
+        time.sleep(0.01)
+
+def coordenada(pieza):
+    return pieza["cx"] if EJE_BANDA == "x" else pieza["cy"]
+
+def centrarPieza():
+    """Mueve la banda con pulsos cortos hasta que la pieza quede en el objetivo.
+    Devuelve la pieza final (dict) o None si no se detectó ninguna."""
+    global msPorPixel
+    if OBJETIVO_PX is not None:
+        objetivo = OBJETIVO_PX
+    else:
+        objetivo = (anchoCuadro if EJE_BANDA == "x" else altoCuadro) / 2
+    t0 = time.time()
+
+    time.sleep(ESPERA_ASENTAR)
+    esperarCuadrosNuevos(CUADROS_FRESCOS)
+    pieza = Main.elegir_pieza(piezasDetectadas, objetivo, EJE_BANDA)
+    anterior = None  # (coordenada, ms, direccion) del pulso previo, para aprender
+
+    for intento in range(MAX_AJUSTES + 1):
+        if pieza is None:
+            print(f"[centrado] t={time.time()-t0:.2f}s sin pieza detectada")
+            return None
+        pos = coordenada(pieza)
+
+        # Aprender cuántos ms de banda equivalen a un píxel
+        if anterior is not None and not pieza["toca_borde"] and not anterior[3]:
+            movido = (pos - anterior[0]) * SENTIDO_AVANCE * anterior[2]
+            msPorPixel = Main.aprender_ms_por_pixel(msPorPixel, anterior[1], movido)
+
+        error = objetivo - pos
+        print(f"[centrado] t={time.time()-t0:.2f}s intento={intento} pos={pos:.0f} "
+              f"error={error:+.0f}px borde={pieza['toca_borde']} ms/px={msPorPixel:.2f}")
+        if abs(error) <= TOLERANCIA_PX and not pieza["toca_borde"]:
+            break
+        if intento == MAX_AJUSTES:
+            break
+
+        avance = error * SENTIDO_AVANCE   # >0: hay que avanzar la banda
+        direccion = 1 if avance > 0 else -1
+        ms = Main.calcular_pulso(avance, msPorPixel)
+        arduino.write(f"{'f' if direccion > 0 else 'v'}{ms}\n".encode())
+        anterior = (pos, ms, direccion, pieza["toca_borde"])
+
+        time.sleep(ms / 1000 + ESPERA_ASENTAR)
+        esperarCuadrosNuevos(CUADROS_FRESCOS)
+        pieza = Main.elegir_pieza(piezasDetectadas, objetivo, EJE_BANDA)
+
+    return pieza
+
+def inspeccionarPieza():
+    pieza = centrarPieza()
+    if pieza is None:
+        etiqueta, vertices, diametro, area, motivo = "Descarte", 0, 0.0, 0.0, "No detectada"
+    elif pieza["toca_borde"]:
+        etiqueta, vertices, diametro, area, motivo = (
+            "Descarte", pieza["vertices"], pieza["diametro"], pieza["area"], "Pieza fuera de cuadro")
+    else:
+        etiqueta, vertices, diametro, area, motivo = (
+            pieza["etiqueta"], pieza["vertices"], pieza["diametro"], pieza["area"], pieza["motivo"])
+    if etiqueta == "Tuerca":
+        arduino.write(b't')
+    elif etiqueta == "Rondana":
+        arduino.write(b'r')
+    else:
+        arduino.write(b'd')
+    try:
+        ConexionBD.registrar_pieza(etiqueta, vertices, diametro, area, motivo)
+    except Exception as error:
+        ventana.after(0, mostrarErrorBD, str(error))
+    ventana.after(0, sumarPieza, etiqueta)
+
+def mostrarErrorBD(mensaje):
+    messagebox.showerror("Error", f"Error en la base de datos: {mensaje}")
+
+def sumarPieza(etiqueta):
+    global totalPiezas, totalTuercas, totalRondanas, totalDescartes
+    totalPiezas += 1
+    if etiqueta == "Tuerca":
+        totalTuercas += 1
+    elif etiqueta == "Rondana":
+        totalRondanas += 1
+    else:
+        totalDescartes += 1
+    actualizarIndicadores()
+    llenarTablas()
+
+def actualizarIndicadores():
+    lbTotal.config(text=f"Piezas totales: {totalPiezas}")
+    lbTuercas.config(text=f"Tuercas: {totalTuercas}")
+    lbRondanas.config(text=f"Rondanas: {totalRondanas}")
+    lbDescartes.config(text=f"Descartes: {totalDescartes}")
+    porcDescartadas = 0
+    porcAceptadas = 0
+    piezasMinuto = 0
+    if totalPiezas > 0:
+        porcDescartadas = totalDescartes * 100 / totalPiezas
+        porcAceptadas = 100 - porcDescartadas
+        minutos = (time.time() - tiempoInicio) / 60
+        if minutos > 0:
+            piezasMinuto = totalPiezas / minutos
+    lbPorcAceptadas.config(text=f"Aceptadas: {porcAceptadas:.1f} %")
+    lbPorcDescartadas.config(text=f"Descartadas: {porcDescartadas:.1f} %")
+    lbPiezasMinuto.config(text=f"Piezas por minuto: {piezasMinuto:.1f}")
+
+def cicloIndicadores():
+    if sistemaActivo:
+        actualizarIndicadores()
+    ventana.after(1000, cicloIndicadores)
+
+def llenarTablas():
+    try:
+        for fila in tablaClasificadas.get_children():
+            tablaClasificadas.delete(fila)
+        for registro in ConexionBD.obtener_clasificadas():
+            tablaClasificadas.insert("", tk.END, values=registro)
+        for fila in tablaRechazadas.get_children():
+            tablaRechazadas.delete(fila)
+        for registro in ConexionBD.obtener_rechazadas():
+            tablaRechazadas.insert("", tk.END, values=registro)
+    except Exception as error:
+        mostrarErrorBD(str(error))
+
+def capturarVideo():
+    global piezasDetectadas, cuadroPpm, numeroCuadro, anchoCuadro, altoCuadro
+    camara = Main.abrir_camara()
+    if not camara.isOpened():
+        ventana.after(0, mostrarErrorCamara)
+        return
+    while True:
+        correcto, cuadro = camara.read()
+        if not correcto:
+            break
+        alto, ancho = cuadro.shape[:2]
+        cuadro, piezasDetectadas = Main.procesar_frame(cuadro)
+        anchoCuadro, altoCuadro = ancho, alto
+        numeroCuadro += 1
+        escala = 640 / ancho
+        cuadro = cv2.resize(cuadro, (640, int(alto * escala)))
+        cuadro = cv2.cvtColor(cuadro, cv2.COLOR_BGR2RGB)
+        cabecera = f"P6\n{cuadro.shape[1]} {cuadro.shape[0]}\n255\n".encode()
+        cuadroPpm = cabecera + cuadro.tobytes()
+    camara.release()
+
+def mostrarErrorCamara():
+    messagebox.showerror("Error", "No se pudo abrir la cámara.")
+
+def mostrarVideo():
+    if cuadroPpm is not None:
+        imagen = tk.PhotoImage(data=cuadroPpm, format="PPM")
+        lbVideo.config(image=imagen)
+        lbVideo.image = imagen
+    ventana.after(30, mostrarVideo)
+
+def iniciar():
+    global sistemaActivo, tiempoInicio, totalPiezas, totalTuercas, totalRondanas, totalDescartes
+    if arduino and arduino.is_open:
+        totalPiezas = 0
+        totalTuercas = 0
+        totalRondanas = 0
+        totalDescartes = 0
+        tiempoInicio = time.time()
+        sistemaActivo = True
+        arduino.write(b'i')
+        btnIniciar.config(state=tk.DISABLED)
+        btnDetener.config(state=tk.NORMAL)
+        btnVibrar.config(state=tk.NORMAL)
+        btnNoVibrar.config(state=tk.NORMAL)
+        actualizarIndicadores()
+    else:
+        messagebox.showwarning("Advertencia", "No hay conexión con el Arduino.")
+
+def detener():
+    global sistemaActivo
+    if arduino and arduino.is_open:
+        arduino.write(b'x')
+    sistemaActivo = False
+    btnIniciar.config(state=tk.NORMAL)
+    btnDetener.config(state=tk.DISABLED)
+    btnVibrar.config(state=tk.DISABLED)
+    btnNoVibrar.config(state=tk.DISABLED)
+
+def vibrar():
+    arduino.write(b'a')
+
+def noVibrar():
+    arduino.write(b'b')
+
+def crearTabla(contenedor, columnas):
+    tabla = ttk.Treeview(contenedor, columns=columnas, show="headings", height=7)
+    for columna in columnas:
+        tabla.heading(columna, text=columna)
+        tabla.column(columna, width=110, anchor="center")
+    return tabla
+
+ventana = tk.Tk()
+ventana.title("Sistema Inteligente de Inspección y Clasificación Industrial")
+ventana.geometry("1250x820")
+
+frameSuperior = tk.Frame(ventana)
+frameSuperior.pack(pady=5)
+
+lbVideo = tk.Label(frameSuperior, text="Cargando cámara...")
+lbVideo.grid(row=0, column=0, padx=10, pady=10)
+
+frameControles = tk.Frame(frameSuperior)
+frameControles.grid(row=0, column=1, padx=10, pady=10, sticky="n")
+
+gbControl = tk.LabelFrame(frameControles, text="Control", padx=10, pady=10)
+gbControl.pack(fill="x", pady=5)
+btnIniciar = tk.Button(gbControl, text="Iniciar", width=14, command=iniciar)
+btnIniciar.grid(row=0, column=0, padx=5, pady=5)
+btnDetener = tk.Button(gbControl, text="Detener", width=14, command=detener, state=tk.DISABLED)
+btnDetener.grid(row=0, column=1, padx=5, pady=5)
+btnVibrar = tk.Button(gbControl, text="Vibrar", width=14, command=vibrar, state=tk.DISABLED)
+btnVibrar.grid(row=1, column=0, padx=5, pady=5)
+btnNoVibrar = tk.Button(gbControl, text="No vibrar", width=14, command=noVibrar, state=tk.DISABLED)
+btnNoVibrar.grid(row=1, column=1, padx=5, pady=5)
+
+gbContadores = tk.LabelFrame(frameControles, text="Contadores", padx=10, pady=10)
+gbContadores.pack(fill="x", pady=5)
+lbTotal = tk.Label(gbContadores, text="Piezas totales: 0", font=("Arial", 11))
+lbTotal.pack(anchor="w")
+lbTuercas = tk.Label(gbContadores, text="Tuercas: 0", font=("Arial", 11))
+lbTuercas.pack(anchor="w")
+lbRondanas = tk.Label(gbContadores, text="Rondanas: 0", font=("Arial", 11))
+lbRondanas.pack(anchor="w")
+lbDescartes = tk.Label(gbContadores, text="Descartes: 0", font=("Arial", 11))
+lbDescartes.pack(anchor="w")
+
+gbIndicadores = tk.LabelFrame(frameControles, text="Indicadores", padx=10, pady=10)
+gbIndicadores.pack(fill="x", pady=5)
+lbPorcAceptadas = tk.Label(gbIndicadores, text="Aceptadas: 0.0 %", font=("Arial", 11))
+lbPorcAceptadas.pack(anchor="w")
+lbPorcDescartadas = tk.Label(gbIndicadores, text="Descartadas: 0.0 %", font=("Arial", 11))
+lbPorcDescartadas.pack(anchor="w")
+lbPiezasMinuto = tk.Label(gbIndicadores, text="Piezas por minuto: 0.0", font=("Arial", 11))
+lbPiezasMinuto.pack(anchor="w")
+
+frameTablas = tk.Frame(ventana)
+frameTablas.pack(pady=5)
+
+gbClasificadas = tk.LabelFrame(frameTablas, text="Piezas clasificadas")
+gbClasificadas.grid(row=0, column=0, padx=10)
+tablaClasificadas = crearTabla(gbClasificadas, ("ID", "Tipo", "Vértices", "Tamaño", "Área", "Fecha y hora"))
+tablaClasificadas.pack()
+
+gbRechazadas = tk.LabelFrame(frameTablas, text="Piezas rechazadas")
+gbRechazadas.grid(row=0, column=1, padx=10)
+tablaRechazadas = crearTabla(gbRechazadas, ("ID", "Tipo", "Motivo", "Fecha y hora"))
+tablaRechazadas.pack()
+
+conectar()
+llenarTablas()
+
+hiloVideo = threading.Thread(target=capturarVideo)
+hiloVideo.daemon = True
+hiloVideo.start()
+
+mostrarVideo()
+cicloIndicadores()
+
+ventana.mainloop()
